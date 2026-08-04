@@ -47,6 +47,45 @@ import swaggerUi from 'swagger-ui-express';
 
 const API_SPEC_PATH = path.join(__dirname, '../seerr-api.yml');
 
+let sessionStoreRecoveryInFlight = false;
+
+/**
+ * Recycles the shared TypeORM datasource connection after a session-store
+ * error. See the comment at the TypeormStore construction below for why
+ * this exists — a stuck connection otherwise silently drops every login's
+ * session forever, with no error surfaced anywhere, until the process is
+ * restarted by hand.
+ */
+async function recoverSessionStoreConnection(err: Error): Promise<void> {
+  logger.error(
+    'Session store reported an error — recovering the database connection so future logins are not silently dropped',
+    { label: 'Session', errorMessage: err?.message ?? String(err) }
+  );
+  if (sessionStoreRecoveryInFlight) {
+    return;
+  }
+  sessionStoreRecoveryInFlight = true;
+  try {
+    if (dataSource.isInitialized) {
+      await dataSource.destroy();
+    }
+    await dataSource.initialize();
+    logger.info('Session store database connection recovered', {
+      label: 'Session',
+    });
+  } catch (recoveryErr) {
+    logger.error(
+      'Failed to recover the session store database connection — sessions will not persist until the app is restarted',
+      {
+        label: 'Session',
+        errorMessage: (recoveryErr as Error)?.message ?? String(recoveryErr),
+      }
+    );
+  } finally {
+    sessionStoreRecoveryInFlight = false;
+  }
+}
+
 logger.info(`Starting Seerr version ${getAppVersion()}`);
 const dev = process.env.NODE_ENV !== 'production';
 const app = next({ dev });
@@ -217,6 +256,22 @@ app
         store: new TypeormStore({
           cleanupLimit: 2,
           ttl: 60 * 60 * 24 * 30,
+          // Without this, a failed session read/write (e.g. SQLite hitting
+          // ENOSPC during a disk-pressure event) is swallowed completely —
+          // TypeormStore's own handleError() just emits an unlistened
+          // "disconnect" event. Worse, TypeORM's sqlite driver serializes
+          // every query through one persistent connection's command queue;
+          // a write that fails mid-flight under ENOSPC can leave that queue
+          // stuck, silently hanging every session read/write after it for
+          // the rest of the process's life — real users keep authenticating
+          // successfully against the auth provider while never actually
+          // getting a persisted session, with nothing in the logs to show
+          // why. Recycling the shared datasource connection on any session
+          // store error clears a stuck queue immediately instead of needing
+          // a manual container restart to notice and fix it.
+          onError: (_store, err) => {
+            void recoverSessionStoreConnection(err);
+          },
         }).connect(sessionRespository) as Store,
       })
     );
